@@ -1,0 +1,52 @@
+            
+            
+            // If the spike buffer is not filled or the thresholds are not stabilised then do not search for spikes
+            if(this.spikeBuffer[chIdx].length < this.SPIKE_LENGTH) return;
+            if(threshold1 < 20) return;
+            
+            const isAwayFromLastSpike      = count > this.lastSpike[chIdx] + this.MIN_SPIKE_GAP;
+            const isAboveThreshold1        = absValue > threshold1 && absValue < threshold2;
+
+            // If the value crosses the first threshold, create a spike candidate at count
+            if( isAboveThreshold1 && isAwayFromLastSpike ) {
+                this.spikeCandidates[chIdx].push(count);
+            }
+
+            this.spikeCandidates[chIdx].forEach((candidate) => {
+
+                const isAboveThreshold2 = absValue > threshold2;
+                const isNotItself       = count - candidate > 1;
+                const isAfterBeforePeak = count - candidate < this.BEFORE_PEAK
+
+                // If the value crosses the second threshold and there is an existing candidate within the range of BEFORE_PEAK, add a spike to the spikes queue
+                if(candidate && isAboveThreshold2 && isAfterBeforePeak && isNotItself) {
+        
+                    this.spikesQueue[chIdx].push(candidate);
+                    this.spikeCandidates[chIdx]  = [];
+                }
+            })
+            
+            // For every spike in the spike queue, 
+            const newSpikesQueue = [] as number[];
+            this.spikesQueue[chIdx].forEach((start) => {
+                // Check if the current spike is within the lastSpikes + MIN_SPIKE_GAP range
+                if(count < this.lastSpike[chIdx] + this.MIN_SPIKE_GAP) return;
+                
+                // check if SPIKE_LENGTH samples have passed since the candidate start, If so, add the spike buffer (containing SPIKE_LENGTH samples) to the spikes array
+                if(count - start >= this.SPIKE_LENGTH) { 
+                    
+                    // Remove any spike candidates and mark this spike as the last spike
+                    this.lastSpike[chIdx]       = count;
+
+                    // Add the detected spike to the spikes array
+                    this.spikes[chIdx].push(this.spikeBuffer[chIdx]);
+                    return;
+                }          
+                
+                // If spike has been detected, remove it from the spikes queue
+                newSpikesQueue.push(start);
+            })            
+
+            this.spikesQueue[chIdx] = newSpikesQueue;                     
+        })
+

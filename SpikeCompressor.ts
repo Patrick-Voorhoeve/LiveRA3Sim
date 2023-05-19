@@ -1,8 +1,10 @@
-import fs           from 'fs';
-import path         from 'path';
-import { parse }    from 'csv-parse';
-import { highPass, std, timer }    from './utils';
-import { plot, Plot } from 'nodeplotlib';
+import fs               from 'fs';
+import path             from 'path';
+import { parse }        from 'csv-parse';
+import { plot, Plot }   from 'nodeplotlib';
+import * as m           from 'mathjs';
+import { channel }      from 'diagnostics_channel';
+
 
 type Welfords           = { mean: number , sumSquaredDiff: number };
 
@@ -18,23 +20,34 @@ class SpikeCompressor {
 
     plots               = [] as Plot[];
 
+    // Initialisation and pre-processing constants
 	NUM_CHANNELS 		= 32;
 	SAMPLE_RATE 		= 30000;
     CUTOFF_FREQ         = 300;
+    
+    // Spike buffer constants
     MAX_BUFFER_LENGTH   = 1024;	
     SPIKE_LENGTH        = 22;                                                   // Length of a spike from the crossing
-    BEFORE_PEAK         = 3;                                                    // Maximum number of samples between the crossing and the peak that qualify as a spike
-    MIN_SPIKE_GAP       = 5;                                                    // Minimum distance between the end of one spike and the start of a new spike
-    
+
+    // Peak detection constants
+    AFTER_CROSS         = 0;                                                    // The crossing of the second threshold must happen between AFTER_CROSS and BEFORE_PEAK
+    BEFORE_PEAK         = 5;                                                    // samples after the first crossing    
+    MIN_THRESHOLD1      = 23;
+    MIN_THRESHOLD2      = 60;
+
+    // Compression constants
+    SPIKE_BUFFER_LENGTH = 100;                                                  // Number of spikes to add to the "spike" array (of a channel) before compressing the buffer    
+
     emptyChannels       = Array.from(Array(this.NUM_CHANNELS).keys());
 
     thresholds          = this.emptyChannels.map(ch => ({ mean: 0, sumSquaredDiff: 0 } as Welfords) );
 
     spikeBuffer         = this.emptyChannels.map(ch => [] as number[]);         // Stores the last SPIKE_LENGTH readings for use in the spike detection algorithm
-    spikeCandidates     = this.emptyChannels.map(ch => [] as number[]);  // Channel array where each channel contains an array of potential spike start times
+    spikeCandidates     = this.emptyChannels.map(ch => [] as number[]);         // Channel array where each channel contains an array of potential spike start times
     spikesQueue         = this.emptyChannels.map(ch => [] as number[]);         // Holds the starting point of spikes who are waiting for the full SPIKE_LENGTH of data to be processed
     lastSpike           = this.emptyChannels.map(ch => 0);                      // Array that stores the end points of real spikes
     spikes              = this.emptyChannels.map(ch => [] as number[][]);       // An array of spike data for each channel
+    spikeIndices        = this.emptyChannels.map(ch => [] as number[]);
 
     plot = () => {                    
         plot( this.plots );        
@@ -56,11 +69,19 @@ class SpikeCompressor {
 
         
         filteredRow.forEach((value, chIdx) => {
-            // Use Welford's online algorithm to calculate the running standard deviation of the channel.
-            let { mean: M, sumSquaredDiff: S }   = this.thresholds[chIdx];            
-            const n                              = this.count;
-            const x                              = value;
-            const absValue                       = Math.abs(value);
+
+            // Calculate the thesholds
+            // ###############################################################################################
+            // Calculates the thresholds for the threshold agorithm. These
+            // are calculated based on the standard deviation of the signal.
+            // As this is an "on-line" algorithm, Welfords standard deviation
+            // algorithm is used to keep a running track of the standard deviation.
+
+            // Use Welford's online algorithm to calculate the running standard deviation of the channel.            
+            const S                 = this.thresholds[chIdx].sumSquaredDiff;           
+            const M                 = this.thresholds[chIdx].mean;           
+            const n                 = this.count;
+            const x                 = value;
 
             // Calculate the new mean and sumSquaredDiff    
             const M2                = M + (x - M) / n;
@@ -68,70 +89,126 @@ class SpikeCompressor {
             
             // Calculate the standard deviation and thresholds from the above values
             const std               = Math.sqrt(S2 / (n - 1));
-            const threshold1        = std * 0.8;
-            const threshold2        = std * 2.2;                        
+            const threshold1        = Math.max(std * 0.9, this.MIN_THRESHOLD1);
+            const threshold2        = Math.max(std * 2.2, this.MIN_THRESHOLD2);                        
 
             // Update the thresholds array with the new values  
             this.thresholds[chIdx].mean             = M2;
             this.thresholds[chIdx].sumSquaredDiff   = S2;                    
 
+            // Detect Spikes Via Two Threshold System
+            // ###############################################################################################
+            // This two threshold system is used to detect spikes in a channel.
+            // It works by defining two thresholds based on the standard deviation
+            // of the signal. When a signal crosses the first threshold, it checks N
+            // steps ahead to see if it also crosses the second threshold. It counts
+            // any that do as a spike. The algorithm also makes sure that spikes
+            // have a minimum amount of time before another spike can be detected.            
+
             // Append the channel value to the spikeBuffer. Use slice to ensure spikeBuffer always has a size of SPIKE_LENGTH
-            this.spikeBuffer[chIdx]                 = [ ...( this.spikeBuffer[chIdx].length >= this.SPIKE_LENGTH ? this.spikeBuffer[chIdx].slice(1) : this.spikeBuffer[chIdx] ), value ]            
+            this.spikeBuffer[chIdx]     = [ ...( this.spikeBuffer[chIdx].length >= this.SPIKE_LENGTH ? this.spikeBuffer[chIdx].slice(1) : this.spikeBuffer[chIdx] ), value ]            
 
-            // If the spike buffer is not filled or the thresholds are not stabilised then do not search for spikes
+            // If the spike buffer is not full then skip
             if(this.spikeBuffer[chIdx].length < this.SPIKE_LENGTH) return;
-            if(threshold1 < 20) return;
-            
-            const isAwayFromLastSpike      = count > this.lastSpike[chIdx] + this.MIN_SPIKE_GAP;
-            const isAboveThreshold1        = absValue > threshold1 && absValue < threshold2;
 
-            // If the value crosses the first threshold, create a spike candidate at count
-            if( isAboveThreshold1 && isAwayFromLastSpike ) {
-                this.spikeCandidates[chIdx].push(count);
-            }
+            // The value that we look at will be the FIRST value in the spike buffer (SPIKE_LENGTH samples away from real time)
+            const val                   = this.spikeBuffer[chIdx][0];                        
+            const absVal                = m.abs(val);
 
-            this.spikeCandidates[chIdx].forEach((candidate) => {
+            // If the value crosses the first threshold
+            if(absVal > threshold1) {
 
-                const isAboveThreshold2 = absValue > threshold2;
-                const isNotItself       = count - candidate > 1;
-                const isAfterBeforePeak = count - candidate < this.BEFORE_PEAK
+                // Determine the direction of the second threshold (is the spike going up or down)                                
+                const threshold2Upper   = threshold2;
+                const threshold2Lower   = threshold2 * -1;
 
-                // If the value crosses the second threshold and there is an existing candidate within the range of BEFORE_PEAK, add a spike to the spikes queue
-                if(candidate && isAboveThreshold2 && isAfterBeforePeak && isNotItself) {
-        
-                    this.spikesQueue[chIdx].push(candidate);
-                    this.spikeCandidates[chIdx]  = [];
+                // Check to see if the value crosses the seconds threshold within BEFORE_PEAK points                
+                for(let i = this.AFTER_CROSS; i <= this.BEFORE_PEAK; i++) {
+                    const val2 = this.spikeBuffer[chIdx][i];
+
+                    // If it crosses the second threshold a peak has been detected. 
+                    // Push the spike to the spikes buffer.
+                    // Empty this channels spike buffer so that no new spikes can be detected until AFTER this spike.
+                    if( val > 0 ? val2 > threshold2Upper : val2 < threshold2Lower) {
+                        const spikeData         = [...this.spikeBuffer[chIdx]];
+                        const spikeIndex        = count - this.SPIKE_LENGTH;
+                        this.spikeBuffer[chIdx] = [];
+
+                        this.spikes[chIdx].push(spikeData);
+                        this.spikeIndices[chIdx].push(spikeIndex);
+                    }
                 }
-            })
-            
-            // For every spike in the spike queue, 
-            const newSpikesQueue = [] as number[];
-            this.spikesQueue[chIdx].forEach((start) => {
-                // Check if the current spike is within the lastSpikes + MIN_SPIKE_GAP range
-                if(count < this.lastSpike[chIdx] + this.MIN_SPIKE_GAP) return;
-                
-                // check if SPIKE_LENGTH samples have passed since the candidate start, If so, add the spike buffer (containing SPIKE_LENGTH samples) to the spikes array
-                if(count - start >= this.SPIKE_LENGTH) { 
-                    
-                    // Remove any spike candidates and mark this spike as the last spike
-                    this.lastSpike[chIdx]       = count;
-
-                    // Add the detected spike to the spikes array
-                    this.spikes[chIdx].push(this.spikeBuffer[chIdx]);
-                    return;
-                }          
-                
-                // If spike has been detected, remove it from the spikes queue
-                newSpikesQueue.push(start);
-            })            
-
-            this.spikesQueue[chIdx] = newSpikesQueue;            
+            }
             
         })
+        // Train the PCA Algorithm to find principle components 
+        // ###############################################################################################
+        // The PCA algorithm requires a bunch of datapoints found using training data.
+        // While training mode is active, this section will use the live data to calculate
+        // the principle component coefficients needed for the compression algorithm.
 
+        // Asume that we aready have the key values from runnings training data elsewhere. (I'm using the training data from the py script)         
+        // In training data Qty_principle_components = 4.       
+        const sampleMean                = 22;
+        const compressedMean            = [-115.21631559, -20.40026275, -2.17209171, 0.88116711];
+        const prinicpleCoeff            = [
+            [ 0.22092193 ,0.11558138  ,-0.21872051 ,0.37172734   ],
+            [ 0.30996979 ,0.15590247  ,-0.26609597 ,0.34530065   ],
+            [ 0.33207249 ,0.16399986  ,-0.23350182 ,0.1798407    ],
+            [ 0.34520316 ,0.15720681  ,-0.17618261 ,0.00708204   ],
+            [ 0.33748027 ,0.13236452  ,-0.09906053 ,-0.13809233  ],
+            [ 0.31999083 ,0.09622249  ,-0.02029416 ,-0.22862091  ],
+            [ 0.29940146 ,0.0552858   ,0.05841917  ,-0.26879006  ],
+            [ 0.27570837 ,0.01144066  ,0.14106933  ,-0.26928983  ],
+            [ 0.24976398 ,-0.03503576 ,0.22421329  ,-0.22981739  ],
+            [ 0.22309473 ,-0.0857638  ,0.29285845  ,-0.14309402  ],
+            [ 0.19717888 ,-0.13959793 ,0.32705755  ,-0.01600818  ],
+            [ 0.17181376 ,-0.19323624 ,0.31075467  ,0.12294715   ],
+            [ 0.14671264 ,-0.24203982 ,0.24896777  ,0.22944826   ],
+            [ 0.12279778 ,-0.27909411 ,0.1548717   ,0.27321599   ],
+            [ 0.10111053 ,-0.30258439 ,0.0492714   ,0.25135961   ],
+            [ 0.08204061 ,-0.31325844 ,-0.04798948 ,0.17961701   ],
+            [ 0.06559903 ,-0.31458296 ,-0.13010998 ,0.08260568   ],
+            [ 0.05129058 ,-0.30863557 ,-0.19506353 ,-0.02281793  ],
+            [ 0.03849774 ,-0.29780081 ,-0.24144244 ,-0.11958309  ],
+            [ 0.02737146 ,-0.28140923 ,-0.26782115 ,-0.19380861  ],
+            [ 0.01843086 ,-0.26248544 ,-0.27446996 ,-0.24009034  ],
+            [ 0.01076361 ,-0.24122548 ,-0.26766447 ,-0.25659321  ]
+        ];
+       
+
+        // Using the above trained PCA components, compress the data
+        // ###############################################################################################
+        // This algorithm uses a set of training and testing data
+        // It uses the training data to sample the mean and Eigenvalues 
+        // and Eigenvectors. Using these values, the compression itself 
+        // is very computationaly unintensive.                
+        
+        const spikeList = this.spikes;        
+
+        spikeList.forEach(channel =>  {
+
+            // Wait until at least SPIKE_BUFFER_LENGTH spikes have been detected for this channel
+            if(channel.length < this.SPIKE_BUFFER_LENGTH) return;
+            
+            // Initialise the matrices
+            const channelMatrix         = m.matrix(channel);
+            const coeffMatrix           = m.matrix(prinicpleCoeff);
+            const meanMatrix            = m.matrix(compressedMean);
+
+            // Apply the compression maths
+            const mult                  = m.multiply(channelMatrix, coeffMatrix);            
+            const compressed            = m.subtract(mult, meanMatrix)                                    
+
+            // Send the compressed data to the frontend
+
+            this.spikes = this.emptyChannels.map(ch => [] as number[][]); 
+        })
+        
+        
         // #######################################
         // TESTING ONLY
-        const testIterations = 10000
+        const testIterations = 1000
 
         if(this.count <= testIterations) {
             rawBuffer.push(filteredRow);
@@ -148,7 +225,7 @@ class SpikeCompressor {
             // this.plots.push({y: testRaw, type: 'scatter'})            
             // this.plots.push({y: testSpikes.flat(), type: 'scatter'})            
 
-            // PLOT EVERY CHANNEL AND EVERY SPIKE
+            // PLOT EVERY CHANNEL AND EVERY SPIKE            
             for(const channel of this.spikes) for(const spike of channel) this.plots.push({y: spike, type: 'scatter'})                        
 
             // PLOT EVERY SPIKE OF A SINGLE CHANNEL
@@ -201,73 +278,3 @@ class SpikeCompressor {
 
 
 export default SpikeCompressor
-
-
-        // ##############################
-        // ###### PRE-PROCESSING ########
-        
-        // // Cast all values to floats
-        // const buffer        = this.buffer.map(v => v.map(j => parseFloat(String(j))));       
-        
-        // const emptyChannels = Array.from(Array(this.NUM_CHANNELS).keys());
-
-        // // Transpose the buffer array to separate the channels.     
-        // const channels      = emptyChannels.map(chIdx => buffer.map(row => row[chIdx]));
-
-        // // Apply high-pass filtering to the buffer
-        // const filtered      = highPass(channels, 300, this.SAMPLE_RATE);                    
-
-        // #############################
-        // ####### COMPRESSION #########
-        
-        // this.detectSpikes(filtered);
-                
-        
-        // if(isFirst) this.plots.push({ y: channels[0], type: 'scatter' })
-        // if(isFirst) this.plots.push({ y: filtered[0], type: 'scatter' })
-        // if(isFirst) this.plot();
-
-        // ############################
-        // ######## SENDING ###########
-        // Send the data to the frontend for decompression
-
-
-    /** Takes a buffer array containing C channels and generates an array of raw spike data */
-    // detectSpikes = (channels: Buffer) => {
-    //     const emptyChannels = Array.from(Array(this.NUM_CHANNELS).keys());
-    //     const spikes        = emptyChannels.map(ch => [] as number[][]);        
-
-    //     // Create an array of spikes by finding spikes that cross both thresholds
-    //     channels.forEach((channel, chIdx) => {
-
-    //         // Generate the thresholds from the standard deviation of the channel
-    //         const THRESHOLD_1 = std(channel) * 0.8;
-    //         const THRESHOLD_2 = std(channel) * 2.2;
-
-    //         // Detect a spike
-    //         channel.forEach((value, idx) => {                          
-
-    //             // If the amount of time since the last spike is less than MIN_SPIKE_GAP, skip.
-    //             if(idx - this.lastSpikeIdx < this.MIN_SPIKE_GAP) return;
-
-    //             // Detect first threshold crossing
-    //             if(!lastPass && value > THRESHOLD_1) lastPass = idx;
-
-    //             // If first threshold has already been detected, detect the second crossing
-    //             if(!lastPass) return;                            
-    //             if(value > THRESHOLD_2) {
-    //                 this.lastSpikeIdx   = idx;                    
-                    
-    //                 const spikeData     = channel.slice(lastPass, lastPass + this.SPIKE_LENGTH);
-    //                 spikes[chIdx].push(spikeData);
-
-    //                 return lastPass     = false;
-    //             }
-
-    //             // If the amount of samples since the first threshold is greater than the MAX_SPIKE_LENGTH then stop detecting second crossing.
-    //             if(idx - lastPass > this.SPIKE_LENGTH)  return lastPass = false;                                
-
-    //         })
-    //     })
-    // }
-

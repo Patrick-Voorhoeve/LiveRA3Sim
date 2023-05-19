@@ -10,6 +10,7 @@
   "license": "ISC",
   "dependencies": {
     "csv-parse": "^5.3.10",
+    "mathjs": "^11.8.0",
     "nodeplotlib": "^1.1.2"
   },
   "devDependencies": {
